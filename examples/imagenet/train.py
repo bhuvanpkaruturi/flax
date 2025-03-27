@@ -346,7 +346,7 @@ def train_and_evaluate(
   )
 
   state = create_train_state(rng, config, model, image_size, learning_rate_fn)
-  state = restore_checkpoint(state, workdir)
+  # state = restore_checkpoint(state, workdir)
   # step_offset > 0 if restarting from checkpoint
   step_offset = int(state.step)
 
@@ -412,8 +412,8 @@ def train_and_evaluate(
           step + 1, {f'eval_{key}': val for key, val in summary.items()}
       )
       writer.flush()
-    if (step + 1) % steps_per_checkpoint == 0 or step + 1 == num_steps:
-      save_checkpoint(state, workdir)
+    # if (step + 1) % steps_per_checkpoint == 0 or step + 1 == num_steps:
+    #   save_checkpoint(state, workdir)
 
   # Wait until computations are done before exiting
   jax.random.normal(jax.random.key(0), ()).block_until_ready()
