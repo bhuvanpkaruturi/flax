@@ -23,7 +23,8 @@ def get_config():
   """Get the hyperparameter configuration for Fake data benchmark."""
   # Override default configuration to avoid duplication of field definition.
   config = default_lib.get_config()
-  config.batch_size = 64
+  # batch size must be divisible by number of devices.
+  config.batch_size = 64 * jax.device_count()
   # Using half precision does not work on TPUs
   config.half_precision = False
   config.num_epochs = 5
