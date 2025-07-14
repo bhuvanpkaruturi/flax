@@ -19,6 +19,7 @@ import functools
 from functools import partial
 import typing as tp
 from typing import Any
+from flax import config
 
 import jax
 import treescope  # type: ignore[import-untyped]
@@ -27,6 +28,9 @@ from flax import errors
 from flax.nnx import filterlib, reprlib, tracers, visualization
 from flax.typing import Missing, PathParts, SizeBytes
 import jax.tree_util as jtu
+import jax.numpy as jnp
+from jax._src.core import mutable_array, MutableArray
+from jax._src.state.types import AbstractRef
 
 A = tp.TypeVar('A')
 B = tp.TypeVar('B')
@@ -39,6 +43,14 @@ AxisName = str
 AxisIndex = int
 AddAxisHook = tp.Callable[[V, AxisIndex, AxisName | None], None]
 RemoveAxisHook = tp.Callable[[V, AxisIndex, AxisName | None], None]
+
+MUTABLE_DEFAULT = True if config.flax_mutable_array else None
+
+
+def is_mutable_array(x) -> tp.TypeGuard[MutableArray]:
+  return isinstance(x, jax.Array | AbstractRef | MutableArray) and isinstance(
+    jax.typeof(x), AbstractRef | MutableArray
+  )
 
 
 @dataclasses.dataclass
@@ -127,6 +139,8 @@ class Variable(tp.Generic[A], reprlib.Representable):
   def __init__(
     self,
     value: tp.Union[A, VariableMetadata[A]],
+    *,
+    mutable: bool | None = MUTABLE_DEFAULT,
     **metadata: tp.Any,
   ):
     var_t = type(self)
@@ -136,7 +150,17 @@ class Variable(tp.Generic[A], reprlib.Representable):
       metadata.update(value.metadata)
       value = tp.cast(A, value.raw_value)
 
-    object.__setattr__(self, 'raw_value', value)
+    if mutable is None:
+      _value = value
+    elif mutable:
+      if is_mutable_array(value):
+        _value = tp.cast(A, value)
+      else:
+        _value = mutable_array(jnp.asarray(value))
+    else:
+      _value = tp.cast(A, jnp.asarray(value))
+
+    object.__setattr__(self, 'raw_value', _value)
 
     if hasattr(var_t, 'on_get_value') and 'on_get_value' not in metadata:
       metadata['on_get_value'] = var_t.on_get_value
@@ -160,14 +184,15 @@ class Variable(tp.Generic[A], reprlib.Representable):
   def __getattr__(self, name: str) -> tp.Any:
     if name in object.__getattribute__(self, '_var_metadata'):
       return self._var_metadata[name]
-    return getattr(self.value, name)
+    return getattr(self.raw_value, name)
 
   def __setattr__(self, name: str, value: tp.Any):
-    if not self._trace_state.is_valid():
+    if not self._trace_state.is_valid() and (
+      name != 'value' or not self.mutable
+    ):
       raise errors.TraceContextError(
         f'Cannot mutate {type(self).__name__} from a different trace level'
       )
-
     if (
       name == 'value'
       or name == 'raw_value'
@@ -198,6 +223,18 @@ class Variable(tp.Generic[A], reprlib.Representable):
   def state(cls, value: A, **metadata) -> VariableState[A]:
     return cls(value, **metadata).to_state()
 
+  @property
+  def mutable(self) -> bool:
+    if is_mutable_array(self.raw_value):
+      return True
+    elif isinstance(self.raw_value, jax.Array):
+      return False
+    else:
+      raise ValueError(
+        f'mutable is only supported for jax.Array and MutableArray, '
+        f'got {type(self.raw_value).__name__}'
+      )
+
   def get_metadata(self):
     return self._var_metadata
 
@@ -214,7 +251,7 @@ class Variable(tp.Generic[A], reprlib.Representable):
     self._var_metadata.update(other.get_metadata())
 
   def update_from_state(self, variable_state: VariableState[A]):
-    object.__setattr__(self, 'raw_value', variable_state.value)
+    object.__setattr__(self, 'raw_value', variable_state.raw_value)
     object.__setattr__(
         self, '_var_metadata', variable_state._var_metadata.copy()
     )
@@ -222,6 +259,9 @@ class Variable(tp.Generic[A], reprlib.Representable):
   @property
   def value(self) -> A:
     value = self.raw_value
+    if is_mutable_array(value):
+      value = value[...]
+
     if 'on_get_value' in self._var_metadata:
       value = self._var_metadata['on_get_value'](self, value)
     return value
@@ -234,7 +274,10 @@ class Variable(tp.Generic[A], reprlib.Representable):
       )
     if 'on_set_value' in self._var_metadata:
       value = self._var_metadata['on_set_value'](self, value)
-    object.__setattr__(self, 'raw_value', value)
+    if config.flax_mutable_array:
+      self.raw_value[...] = value  # type: ignore
+    else:
+      object.__setattr__(self, 'raw_value', value)
 
   def create_value(self, value: A):
     if 'on_create_value' in self._var_metadata:
@@ -250,12 +293,10 @@ class Variable(tp.Generic[A], reprlib.Representable):
       self._var_metadata['on_remove_axis'](self, axis_index, axis_name)
 
   @tp.overload
-  def replace(self, value: B, **kwargs) -> Variable[B]:
-    ...
+  def replace(self, value: B, **kwargs) -> Variable[B]: ...
 
   @tp.overload
-  def replace(self, **kwargs) -> Variable[A]:
-    ...
+  def replace(self, **kwargs) -> Variable[A]: ...
 
   def replace(self, value: tp.Any = Missing, **kwargs) -> Variable[tp.Any]:
     if value is not Missing:
@@ -288,8 +329,7 @@ class Variable(tp.Generic[A], reprlib.Representable):
     obj = object.__new__(type(self))
     object.__setattr__(obj, '_trace_state', self._trace_state)
     object.__setattr__(obj, 'raw_value', kwargs.pop('raw_value'))
-    object.__setattr__(obj, '_var_metadata', self.get_metadata())
-    obj._var_metadata.update(kwargs)
+    object.__setattr__(obj, '_var_metadata', self.get_metadata() | kwargs)
     return obj
 
   @classmethod
@@ -311,7 +351,7 @@ class Variable(tp.Generic[A], reprlib.Representable):
     return VariableState(type(self), self.raw_value, **self._var_metadata)
 
   def __nnx_repr__(self):
-    stats = SizeBytes.from_any(self.value)
+    stats = SizeBytes.from_any(self.raw_value)
     if stats:
       comment = f' # {stats}'
     else:
@@ -378,11 +418,26 @@ class Variable(tp.Generic[A], reprlib.Representable):
   # proxy methods
   # --------------------------------------------
 
-  def __getitem__(self, key) -> tp.Any:
+  def __getitem__(self, key) -> jax.Array:
     return self.value[key]  # type: ignore
 
   def __setitem__(self, key, value) -> None:
-    self.value[key] = value  # type: ignore
+    if config.flax_mutable_array:
+      self.raw_value[key] = value  # type: ignore
+    else:
+      if (
+        not is_mutable_array(self.raw_value)
+        and not self._trace_state.is_valid()
+      ):
+        raise errors.TraceContextError(
+          f'Cannot mutate {type(self).__name__} from a different trace level'
+        )
+      if key == ...:
+        self.value = value
+      elif isinstance(self.raw_value, jax.Array):
+        self.raw_value = self.raw_value.at[key].set(value)  # type: ignore
+      else:
+        self.raw_value[key] = value  # type: ignore
 
   def __call__(self, *args, **kwargs) -> tp.Any:
     return self.value(*args, **kwargs)  # type: ignore
@@ -702,6 +757,43 @@ class Variable(tp.Generic[A], reprlib.Representable):
   def __ceil__(self) -> A:
     return self.value.__ceil__()  # type: ignore
 
+  # --------------------------------------------
+
+  def __init_subclass__(cls) -> None:
+    super().__init_subclass__()
+
+    jax.tree_util.register_pytree_with_keys(
+      cls,
+      flatten_with_keys=_variable_flatten_with_keys,
+      unflatten_func=partial(_variable_unflatten, cls),  # type: ignore
+      flatten_func=_variable_flatten,
+    )
+
+
+def _variable_flatten_with_keys(x: Variable[tp.Any]):
+  metadata = tuple(x.get_metadata().items())
+  node = (jtu.GetAttrKey('value'), x.raw_value)
+  return (node,), metadata
+
+def _variable_flatten(x: Variable[tp.Any]):
+  metadata = tuple(x.get_metadata().items())
+  return (x.raw_value,), metadata
+
+
+def _variable_unflatten(
+  cls: type[Variable[tp.Any]],
+  static: tuple[tuple[str, tp.Any], ...],
+  children: tuple[tp.Any],
+):
+  return cls.from_metadata(value=children[0], attributes=dict(static))
+
+jax.tree_util.register_pytree_with_keys(
+  Variable,
+  flatten_with_keys=_variable_flatten_with_keys,
+  unflatten_func=partial(_variable_unflatten, Variable),  # type: ignore
+  flatten_func=_variable_flatten,
+)
+
 
 class Param(Variable[A]):
   """The canonical learnable parameter. All learnable parameters
@@ -879,6 +971,34 @@ class VariableState(tp.Generic[A], reprlib.Representable):
     object.__setattr__(self, 'value', value)
     object.__setattr__(self, '_var_metadata', metadata)
 
+  @property
+  def raw_value(self) -> A:
+    return object.__getattribute__(self, 'value')
+
+  @raw_value.setter
+  def raw_value(self, value: A) -> None:
+    object.__setattr__(self, 'value', value)
+
+  @property
+  def mutable(self) -> bool:
+    if is_mutable_array(self.raw_value):
+      return True
+    elif isinstance(self.raw_value, jax.Array):
+      return False
+    else:
+      raise ValueError(
+        f'mutable is only supported for jax.Array and MutableArray, '
+        f'got {type(self.raw_value).__name__}'
+      )
+
+  def __getattribute__(self, name: str) -> None:
+    if name == 'value':
+      value = object.__getattribute__(self, 'value')
+      if is_mutable_array(value):
+        value = value[...]
+      return value
+    return object.__getattribute__(self, name)
+
   def __getattr__(self, name: str) -> None:
     var_metadata = object.__getattribute__(self, '_var_metadata')
     if name not in var_metadata:
@@ -886,19 +1006,25 @@ class VariableState(tp.Generic[A], reprlib.Representable):
     return var_metadata[name]
 
   def __setattr__(self, name: str, value: Any) -> None:
-    if name == 'type' or name == 'value' or name == '_var_metadata':
+    if name in ('type', 'value', '_var_metadata', 'raw_value'):
       object.__setattr__(self, name, value)
     else:
       self._var_metadata[name] = value
 
   def __delattr__(self, name: str) -> None:
-    if name == 'type' or name == 'value' or name == '_var_metadata':
+    if name in ('type', 'value', '_var_metadata', 'raw_value'):
       object.__delattr__(self, name)
     else:
       del self._var_metadata[name]
 
+  def __getitem__(self, key: Any) -> jax.Array:
+    return self.raw_value[key]  # type: ignore
+
+  def __setitem__(self, key: Any, value: Any) -> None:
+    self.raw_value[key] = value  # type: ignore
+
   def __nnx_repr__(self):
-    stats = SizeBytes.from_any(self.value)
+    stats = SizeBytes.from_any(self.raw_value)
     if stats:
       comment = f' # {stats}'
     else:
@@ -906,13 +1032,13 @@ class VariableState(tp.Generic[A], reprlib.Representable):
 
     yield reprlib.Object(type=type(self), comment=comment)
     yield reprlib.Attr('type', self.type)
-    yield reprlib.Attr('value', self.value)
+    yield reprlib.Attr('value', self.raw_value)
 
     for name, value in self._var_metadata.items():
       yield reprlib.Attr(name, value)
 
   def __treescope_repr__(self, path, subtree_renderer):
-    size_bytes = SizeBytes.from_any(self.value)
+    size_bytes = SizeBytes.from_any(self.raw_value)
     if size_bytes:
       stats_repr = f' # {size_bytes}'
       first_line_annotation = treescope.rendering_parts.comment_color(
@@ -937,7 +1063,7 @@ class VariableState(tp.Generic[A], reprlib.Representable):
     # __init__ logic which should not be called twice
     variable = object.__new__(self.type)
     object.__setattr__(variable, '_trace_state', tracers.TraceState())
-    object.__setattr__(variable, 'raw_value', self.value)
+    object.__setattr__(variable, 'raw_value', self.raw_value)
     object.__setattr__(variable, '_var_metadata', self.get_metadata().copy())
     return variable
 
@@ -960,9 +1086,9 @@ GraphVariableState = VariableState[VariableState[tp.Any]]
 def _variable_state_flatten(x: VariableState[tp.Any], *, with_keys: bool):
   metadata = tuple(x.get_metadata().items())
   if with_keys:
-    node = (jtu.GetAttrKey('value'), x.value)
+    node = (jtu.GetAttrKey('value'), x.raw_value)
   else:
-    node = x.value
+    node = x.raw_value
 
   return (node,), (x.type, metadata)
 
@@ -1173,8 +1299,10 @@ def register_variable_name(
     return partial(register_variable_name, name, overwrite=overwrite)
   typ = tp.cast(type[Variable[A]], typ)
   if not overwrite and name in VariableTypeCache:
-    raise ValueError(f'Name {name} already mapped to type {VariableTypeCache[name]}. '
-                     'To overwrite, call set_variable_name() with `overwrite=True`.')
+    raise ValueError(
+      f'Name {name} already mapped to type {VariableTypeCache[name]}. '
+      'To overwrite, call register_variable_name() with `overwrite=True`.'
+    )
   VariableTypeCache[name] = typ
   return typ
 

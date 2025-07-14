@@ -22,6 +22,7 @@ import typing as tp
 from abc import ABCMeta
 from copy import deepcopy
 
+from flax.nnx import variablelib
 import jax
 import numpy as np
 import treescope  # type: ignore[import-untyped]
@@ -34,12 +35,156 @@ from flax.nnx import (
   tracers,
   visualization,
 )
-from flax.nnx.variablelib import Variable, VariableState
+from flax import config
+from flax.nnx.variablelib import Variable, VariableState, is_mutable_array
 from flax.typing import SizeBytes
 
-G = tp.TypeVar('G', bound='Object')
-
 BUILDING_DOCS = 'FLAX_DOC_BUILD' in os.environ
+
+A = tp.TypeVar('A')
+O = tp.TypeVar('O', bound='Object')
+
+DataTag = '__data__'
+Data = tp.Annotated[A, DataTag]
+Data.__doc__ = """Data marks attributes of a class as pytree data using type annotations.
+
+Data annotations must be used at the class level and will apply to all instances.
+The usage of Data is recommended when type annotations are used already present
+or required e.g. for dataclasses.
+
+Example::
+
+  from flax import nnx
+  import jax
+  import dataclasses
+
+  @dataclasses.dataclass
+  class Foo(nnx.Object):
+    a: nnx.Data[int]  # Annotates `a` as pytree data
+    b: str            # `b` is not pytree data
+
+  foo = Foo(a=42, b='hello')
+
+  assert jax.tree.leaves(foo) == [42]
+"""
+DATA_REGISTRY: set[type] = set()
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class DataAttr:
+  value: tp.Any
+
+
+def data(value: A, /) -> A:
+  """Annotates a an attribute as pytree data.
+
+  The return value from `data` must be directly assigned to an Object attribute
+  which will be registered as a pytree data attribute.
+
+  Example::
+
+    from flax import nnx
+    import jax
+
+    class Foo(nnx.Object):
+      def __init__(self):
+        self.data_attr = nnx.data(42)  # pytree data
+        self.static_attr = "hello"     # static attribute
+
+    foo = Foo()
+
+    assert jax.tree.leaves(foo) == [42]
+
+  Args:
+    value: The value to annotate as data.
+
+  Returns:
+    A value which will register the attribute as data on assignment.
+
+  """
+  return DataAttr(value)  # type: ignore[return-value]
+
+def register_data_type(type_: type, /) -> None:
+  """Registers a type as pytree data type recognized by Object.
+
+  Custom types registered as data will be automatically recognized
+  as data attributes when assigned to an Object attribute. This means
+  that values of this type do not need to be wrapped in `nnx.data(...)`
+  for Object to mark the attribute its being assigned to as data.
+
+  Example::
+
+    from flax import nnx
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class MyType:
+      value: int
+
+    nnx.register_data_type(MyType)
+
+    class Foo(nnx.Object):
+      def __init__(self, a):
+        self.a = MyType(a)  # Automatically registered as data
+        self.b = "hello"     # str not registered as data
+
+    foo = Foo(42)
+
+    assert nnx.is_data_type(foo.a)  # True
+    assert jax.tree.leaves(foo) == [MyType(value=42)]
+
+  """
+  DATA_REGISTRY.add(type_)
+
+
+def is_data_type(value: tp.Any, /) -> bool:
+  """Checks if a value is a registered data type.
+
+  This function checks a the value is registered data type, which means it is
+  automatically recognized as pytree data when assigned to an Object attribute.
+
+  Data types are:
+  - jax.Arrays
+  - np.ndarrays
+  - MutableArrays
+  - Variables (Param, BatchStat, RngState, etc.)
+  - All graph nodes (Object, Module, Rngs, etc.)
+  - Any type registered with `nnx.register_data_type`
+
+  Example::
+
+    from flax import nnx
+    import jax.numpy as jnp
+
+    module = nnx.Linear(1, 1, rngs=nnx.Rngs(0))
+    blocks = [module, module, module]
+
+    assert nnx.is_data_type(jnp.array(42))  # Arrays are data
+    assert nnx.is_data_type(nnx.Param(1))   # Variables are data
+    assert nnx.is_data_type(nnx.Rngs(0))    # Objects are data
+    assert nnx.is_data_type(module)         # Objects are data
+
+    assert not nnx.is_data_type(0.)         # float is not data
+    assert not nnx.is_data_type(1)          # int is not data
+    assert not nnx.is_data_type("hello")    # str is not data
+    assert not nnx.is_data_type(blocks)     # list is not data
+
+
+  Args:
+    value: The value to check.
+
+  Returns:
+    True if the value is a registered data type, False otherwise.
+
+
+  """
+
+  return (
+    graph.is_node_leaf(value)
+    or graph.is_graph_node(value)
+    or type(value) in DATA_REGISTRY
+  )
+
 
 def _collect_stats(
   node: tp.Any, node_stats: dict[int, dict[type[Variable], SizeBytes]]
@@ -57,7 +202,7 @@ def _collect_stats(
     var_type = type(node)
     if issubclass(var_type, nnx.RngState):
       var_type = nnx.RngState
-    size_bytes = SizeBytes.from_any(node.value)
+    size_bytes = SizeBytes.from_any(node.raw_value)
     if size_bytes:
       stats[var_type] = size_bytes
 
@@ -144,34 +289,54 @@ class ObjectMeta(ABCMeta):
     self.__init__(*args, **kwargs)
 
 
-def _graph_node_meta_call(cls: tp.Type[G], *args, **kwargs) -> G:
+def _graph_node_meta_call(cls: tp.Type[O], *args, **kwargs) -> O:
   node = cls.__new__(cls, *args, **kwargs)
   vars(node)['_object__state'] = ObjectState()
+  vars(node)['_object__nodes'] = cls._object__nodes
   cls._object_meta_construct(node, *args, **kwargs)
 
   return node
 
 
 @dataclasses.dataclass(frozen=True, repr=False)
-class Array(reprlib.Representable):
+class ArrayRepr(reprlib.Representable):
   shape: tp.Tuple[int, ...]
   dtype: tp.Any
 
   @staticmethod
-  def from_array(array: jax.Array | np.ndarray) -> Array:
-    return Array(array.shape, array.dtype)
+  def from_array(array: jax.Array | np.ndarray) -> ArrayRepr:
+    return ArrayRepr(array.shape, array.dtype)
 
   def __nnx_repr__(self):
     yield reprlib.Object(type='Array', same_line=True)
     yield reprlib.Attr('shape', self.shape)
     yield reprlib.Attr('dtype', self.dtype)
 
+@dataclasses.dataclass(frozen=True, repr=False)
+class MutableArrayRepr(reprlib.Representable):
+  shape: tp.Tuple[int, ...]
+  dtype: tp.Any
+
+  @staticmethod
+  def from_array(array: jax.Array | np.ndarray) -> MutableArrayRepr:
+    return MutableArrayRepr(array.shape, array.dtype)
+
+  def __nnx_repr__(self):
+    yield reprlib.Object(type='MutableArray', same_line=True)
+    yield reprlib.Attr('shape', self.shape)
+    yield reprlib.Attr('dtype', self.dtype)
 
 class Object(reprlib.Representable, metaclass=ObjectMeta):
+  """Base class for all NNX objects."""
+
   if tp.TYPE_CHECKING:
+    _object__nodes: frozenset[str]
+    _object__is_pytree: bool
     _object__state: ObjectState
 
-  def __init_subclass__(cls, **kwargs) -> None:
+  def __init_subclass__(
+    cls, *, pytree: bool = config.flax_mutable_array, **kwargs
+  ) -> None:
     super().__init_subclass__(**kwargs)
 
     graph.register_graph_node_type(
@@ -183,6 +348,27 @@ class Object(reprlib.Representable, metaclass=ObjectMeta):
       clear=cls._graph_node_clear,
       init=cls._graph_node_init,  # type: ignore
     )
+
+    cls._object__is_pytree = pytree
+    parent_nodes: tp.Iterable[str] = getattr(cls, '_object__nodes', ())
+
+    all_nodes: set[str] = set(parent_nodes)
+
+    all_nodes.add('_object__state')
+    # add DataTag attributes
+    type_: type
+    for name, type_ in cls.__annotations__.items():
+      if type_ != tp.ClassVar and DataTag in getattr(type_, '__metadata__', ()):
+        all_nodes.add(name)
+    cls._object__nodes = frozenset(all_nodes)
+
+    if pytree:
+      jax.tree_util.register_pytree_with_keys(
+        cls,
+        flatten_with_keys=cls._object__flatten_with_paths,
+        unflatten_func=cls._object__unflatten,
+        flatten_func=cls._object__flatten,
+      )
 
     if BUILDING_DOCS:
       # set correct signature for sphinx
@@ -197,13 +383,31 @@ class Object(reprlib.Representable, metaclass=ObjectMeta):
     self._check_valid_context(
       lambda: f"Cannot mutate '{type(self).__name__}' from different trace level"
     )
+    if type(value) is DataAttr:
+      value = value.value
+      if name not in self._object__nodes:
+        self._object__nodes = self._object__nodes.union((name,))
+    elif is_data_type(value):
+      if name not in self._object__nodes:
+        self._object__nodes = self._object__nodes.union((name,))
+    elif type(self)._object__is_pytree and name not in self._object__nodes:
+      for leaf in jax.tree.leaves(value):
+        if isinstance(leaf, jax.Array) or is_mutable_array(leaf):
+          raise TypeError(
+            f"Trying to set '{name}' to a value containing one or more "
+            f"jax.Array, but '{name}' is not a registered as data. "
+            f"Use 'obj.{name} = nnx.data(...)' to register the attribute as data "
+            f"on assignment, or add '{name}: nnx.Data[{type(value).__name__}]' "
+            f'to the class definition. '
+            f'Got value: {value}'
+          )
     object.__setattr__(self, name, value)
 
   def _check_valid_context(self, error_msg: tp.Callable[[], str]) -> None:
     if not self._object__state.trace_state.is_valid():
       raise errors.TraceContextError(error_msg())
 
-  def __deepcopy__(self: G, memo=None) -> G:
+  def __deepcopy__(self: O, memo=None) -> O:
     graphdef, state = graph.split(self)
     graphdef = deepcopy(graphdef)
     state = deepcopy(state)
@@ -217,6 +421,10 @@ class Object(reprlib.Representable, metaclass=ObjectMeta):
       stats = node_stats[id(self)]
       clear_node_stats = True
     else:
+      if id(self) not in OBJECT_CONTEXT.node_stats:
+        raise RuntimeError(
+          f"Object '{type(self).__name__}' not found in node stats. This is a bug."
+        )
       stats = OBJECT_CONTEXT.node_stats[id(self)]
       clear_node_stats = False
 
@@ -254,14 +462,16 @@ class Object(reprlib.Representable, metaclass=ObjectMeta):
             return value.replace(
               raw_value=jax.tree.map(to_shape_dtype, value.raw_value)
             )
+          elif variablelib.is_mutable_array(value) and np.prod(value.shape) > 1:
+            return MutableArrayRepr(value.shape, value.dtype)
           elif (
             isinstance(value, (np.ndarray, jax.Array))
             and np.prod(value.shape) > 1
           ):
-            return Array(value.shape, value.dtype)
+            return ArrayRepr(value.shape, value.dtype)
           return value
 
-        value = jax.tree.map(to_shape_dtype, value)
+        value = jax.tree.map(to_shape_dtype, value, is_leaf=graph.is_graph_node)
         yield reprlib.Attr(name, value)
     finally:
       if clear_seen:
@@ -321,7 +531,62 @@ class Object(reprlib.Representable, metaclass=ObjectMeta):
       if clear_node_stats:
         OBJECT_CONTEXT.node_stats = None
 
+  # pickle support
+  def __getstate__(self):
+    return vars(self).copy()
+
+  def __setstate__(self, state):
+    vars(self).update(state)
+
+  # -------------------------
+  # Pytree Definition
+  # -------------------------
+  def _object__flatten_with_paths(self):
+    obj_vars = vars(self)
+    type_nodes = self._object__nodes
+    node_names: list[str] = []
+    node_attrs: list[tuple[tp.Any, tp.Any]] = []
+    static_attrs: list[tuple[str, tp.Any]] = []
+    for name, value in sorted(obj_vars.items()):
+      if name in type_nodes:
+        node_names.append(name)
+        node_attrs.append((jax.tree_util.GetAttrKey(name), value))
+      else:
+        static_attrs.append((name, value))
+
+    return node_attrs, (tuple(node_names), tuple(static_attrs))
+
+  def _object__flatten(self):
+    obj_vars = vars(self)
+    type_nodes = self._object__nodes
+    node_names: list[str] = []
+    node_attrs: list[tp.Any] = []
+    static_attrs: list[tuple[str, tp.Any]] = []
+    for name, value in sorted(obj_vars.items()):
+      if name in type_nodes:
+        node_names.append(name)
+        node_attrs.append(value)
+      else:
+        static_attrs.append((name, value))
+
+    return node_attrs, (tuple(node_names), tuple(static_attrs))
+
+  @classmethod
+  def _object__unflatten(
+    cls,
+    static: tuple[tuple[str, ...], tuple[tuple[str, tp.Any], ...]],
+    node_attrs: tp.Iterable[tp.Any],
+  ):
+    node_names, static_attrs = static
+    obj = object.__new__(cls)
+    vars_obj = vars(obj)
+    vars_obj.update(zip(node_names, node_attrs, strict=True))
+    vars_obj.update(static_attrs)
+    return obj
+
+  # -------------------------
   # Graph Definition
+  # -------------------------
   def _graph_node_flatten(self):
     nodes = vars(self).copy()
     nodes = sorted(nodes.items())
@@ -345,7 +610,7 @@ class Object(reprlib.Representable, metaclass=ObjectMeta):
     return vars(self).pop(key)
 
   @staticmethod
-  def _graph_node_create_empty(node_type: tp.Type[G]) -> G:
+  def _graph_node_create_empty(node_type: tp.Type[O]) -> O:
     node = object.__new__(node_type)
     return node
 

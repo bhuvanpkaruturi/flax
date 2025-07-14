@@ -279,7 +279,8 @@ class MultiHeadAttention(Module):
       should be divisible by the number of heads.
     in_features: int or tuple with number of input features.
     qkv_features: dimension of the key, query, and value.
-    out_features: dimension of the last projection
+    out_features: dimension of the last projection.
+    in_kv_features: number of input features for computing key and value.
     dtype: the dtype of the computation (default: infer from inputs and params)
     param_dtype: the dtype passed to parameter initializers (default: float32)
     broadcast_dropout: bool: use a broadcasted dropout along batch dims.
@@ -301,6 +302,10 @@ class MultiHeadAttention(Module):
     decode: whether to prepare and use an autoregressive cache.
     normalize_qk: should QK normalization be applied (arxiv.org/abs/2302.05442).
     rngs: rng key.
+    keep_rngs: whether to store the input rngs as attribute (i.e. `self.rngs = rngs`)
+      (default: True). If rngs is stored, we should split the module as
+      `graphdef, params, nondiff = nnx.split(module, nnx.Param, ...)` where `nondiff`
+      contains RNG object associated with stored `self.rngs`.
   """
 
   def __init__(
@@ -309,6 +314,7 @@ class MultiHeadAttention(Module):
     in_features: int,
     qkv_features: int | None = None,
     out_features: int | None = None,
+    in_kv_features: int | None = None,
     *,
     dtype: Dtype | None = None,
     param_dtype: Dtype = jnp.float32,
@@ -330,6 +336,7 @@ class MultiHeadAttention(Module):
     qkv_dot_general_cls: Any = None,
     out_dot_general_cls: Any = None,
     rngs: rnglib.Rngs,
+    keep_rngs: bool = True,
   ):
     self.num_heads = num_heads
     self.in_features = in_features
@@ -338,6 +345,9 @@ class MultiHeadAttention(Module):
     )
     self.out_features = (
       out_features if out_features is not None else in_features
+    )
+    self.in_kv_features = (
+      in_kv_features if in_kv_features is not None else in_features
     )
     self.dtype = dtype
     self.param_dtype = param_dtype
@@ -368,7 +378,6 @@ class MultiHeadAttention(Module):
 
     linear_general = functools.partial(
       LinearGeneral,
-      in_features=self.in_features,
       out_features=(self.num_heads, self.head_dim),
       dtype=self.dtype,
       param_dtype=self.param_dtype,
@@ -381,9 +390,9 @@ class MultiHeadAttention(Module):
     )
     # project inputs_q to multi-headed q/k/v
     # dimensions are then [batch..., length, n_heads, n_features_per_head]
-    self.query = linear_general(rngs=rngs)
-    self.key = linear_general(rngs=rngs)
-    self.value = linear_general(rngs=rngs)
+    self.query = linear_general(self.in_features, rngs=rngs)
+    self.key = linear_general(self.in_kv_features, rngs=rngs)
+    self.value = linear_general(self.in_kv_features, rngs=rngs)
 
     self.query_ln: LayerNorm | None
     self.key_ln: LayerNorm | None
@@ -422,7 +431,7 @@ class MultiHeadAttention(Module):
       dot_general_cls=self.out_dot_general_cls,
       rngs=rngs,
     )
-    self.rngs = rngs if dropout_rate > 0.0 else None
+    self.rngs = rngs.dropout.fork() if keep_rngs and dropout_rate > 0 else None
 
     self.cached_key: nnx.Cache[Array] | None = None
     self.cached_value: nnx.Cache[Array] | None = None
@@ -436,7 +445,7 @@ class MultiHeadAttention(Module):
     *,
     mask: Array | None = None,
     deterministic: bool | None = None,
-    rngs: rnglib.Rngs | None = None,
+    rngs: rnglib.Rngs | rnglib.RngStream | None = None,
     sow_weights: bool = False,
     decode: bool | None = None,
   ):
@@ -475,6 +484,8 @@ class MultiHeadAttention(Module):
     """
     if rngs is None:
       rngs = self.rngs
+    elif isinstance(rngs, rnglib.Rngs):
+      rngs = rngs.dropout
 
     if inputs_k is None:
       if inputs_v is not None:
@@ -537,14 +548,14 @@ class MultiHeadAttention(Module):
           % (expected_shape, query.shape)
         )
       # update key, value caches with our new 1d spatial slices
-      cur_index = self.cache_index.value
+      cur_index = self.cache_index[...]
       zero = jnp.array(0, dtype=lax.dtype(cur_index.dtype))
       indices = (zero,) * len(batch_dims) + (cur_index, zero, zero)
-      key = lax.dynamic_update_slice(self.cached_key.value, key, indices)
-      value = lax.dynamic_update_slice(self.cached_value.value, value, indices)
-      self.cached_key.value = key
-      self.cached_value.value = value
-      self.cache_index.value += 1
+      key = lax.dynamic_update_slice(self.cached_key[...], key, indices)
+      value = lax.dynamic_update_slice(self.cached_value[...], value, indices)
+      self.cached_key[...] = key
+      self.cached_value[...] = value
+      self.cache_index[...] += 1
       # causal mask for cached decoder self-attention:
       # our single query position should only attend to those key
       # positions that have already been generated and cached,
@@ -569,9 +580,10 @@ class MultiHeadAttention(Module):
       if not deterministic:
         if rngs is None:
           raise ValueError(
-            "'rngs' must be provided if 'dropout_rng' is not given."
+            "'rngs' must be provided to __call__ method if "
+            "MultiHeadAttention instance is defined with keep_rngs=False."
           )
-        dropout_rng = rngs.dropout()
+        dropout_rng = rngs()
       else:
         dropout_rng = None
     else:

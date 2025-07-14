@@ -13,6 +13,10 @@
 # limitations under the License.
 
 # %%
+import os
+
+os.environ['FLAX_MUTABLE_ARRAY'] = 'true'
+
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -20,9 +24,9 @@ import numpy as np
 
 from flax import nnx
 
+
 X = np.linspace(-jnp.pi, jnp.pi, 100)[:, None]
 Y = 0.8 * jnp.sin(X) + 0.1 + np.random.normal(0, 0.1, size=X.shape)
-
 
 def dataset(batch_size):
   while True:
@@ -36,7 +40,7 @@ class Linear(nnx.Module):
     self.b = nnx.Param(jnp.zeros((dout,)))
 
   def __call__(self, x):
-    return x @ self.w.value + self.b.value
+    return x @ self.w[...] + self.b[None]
 
 
 class Count(nnx.Variable[nnx.A]):
@@ -51,53 +55,44 @@ class MLP(nnx.Module):
 
   def __call__(self, x):
     self.count[...] += 1
-    return self.linear2(jax.nn.relu(self.linear1(x) * 0.5))
+    return self.linear2(jax.nn.relu(self.linear1(x)) * 0.5)
 
 
-graphdef, params, counts = nnx.split(
-  MLP(din=1, dhidden=32, dout=1, rngs=nnx.Rngs(0)), nnx.Param, Count
-)
+model = MLP(din=1, dhidden=32, dout=1, rngs=nnx.Rngs(0))
 
 
 @jax.jit
-def train_step(params, counts, batch):
-  x, y = batch
+def train_step(model, x, y):
+  graphdef, params, counts = nnx.pure(nnx.split(model, nnx.Param, Count))
 
   def loss_fn(params):
     model = nnx.merge(graphdef, params, counts)
-    y_pred = model(x)
-    new_counts = nnx.state(model, Count)
-    loss = jnp.mean((y - y_pred) ** 2)
-    return loss, new_counts
+    return jnp.mean((y - model(x)) ** 2)
 
-  grad, counts = jax.grad(loss_fn, has_aux=True)(params)
-  #                          |-------- sgd ---------|
-  params = jax.tree.map(lambda w, g: w - 0.1 * g, params, grad)
+  grads = jax.grad(loss_fn)(nnx.freeze(params))
 
-  return params, counts
+  def sgd(w, g):
+    w[...] -= 0.1 * g[...]
+
+  jax.tree.map(sgd, params, grads)
 
 
 @jax.jit
-def test_step(params: nnx.State, counts: nnx.State, batch):
-  x, y = batch
-  model = nnx.merge(graphdef, params, counts)
-  y_pred = model(x)
-  loss = jnp.mean((y - y_pred) ** 2)
-  return {'loss': loss}
+def test_step(model: MLP, x, y):
+  return {'loss': jnp.mean((y - model(x)) ** 2)}
 
 
 total_steps = 10_000
-for step, batch in enumerate(dataset(32)):
-  params, counts = train_step(params, counts, batch)
+for step, (x, y) in enumerate(dataset(32)):
+  train_step(model, x, y)
 
   if step % 1000 == 0:
-    logs = test_step(params, counts, (X, Y))
+    logs = test_step(model, X, Y)
     print(f"step: {step}, loss: {logs['loss']}")
 
   if step >= total_steps - 1:
     break
 
-model = nnx.merge(graphdef, params, counts)
 print('times called:', model.count.value)
 
 y_pred = model(X)

@@ -19,6 +19,7 @@ from flax.nnx import rnglib, variablelib
 from flax.nnx.module import Module
 from flax.nnx.nn import initializers
 from flax.nnx.nn.linear import Linear
+from flax.nnx.nn.dtypes import promote_dtype
 from flax.typing import Dtype, Initializer
 import jax
 import jax.numpy as jnp
@@ -77,18 +78,18 @@ class LoRA(Module):
   """
 
   def __init__(
-      self,
-      in_features: int,
-      lora_rank: int,
-      out_features: int,
-      *,
-      base_module: tp.Optional[Module] = None,
-      dtype: tp.Optional[Dtype] = None,
-      param_dtype: Dtype = jnp.float32,
-      a_initializer: Initializer = default_a_initializer,
-      b_initializer: Initializer = default_b_initializer,
-      lora_param_type: tp.Type[variablelib.Variable] = LoRAParam,
-      rngs: rnglib.Rngs,
+    self,
+    in_features: int,
+    lora_rank: int,
+    out_features: int,
+    *,
+    base_module: tp.Optional[Module] = None,
+    dtype: tp.Optional[Dtype] = None,
+    param_dtype: Dtype = jnp.float32,
+    a_initializer: Initializer = default_a_initializer,
+    b_initializer: Initializer = default_b_initializer,
+    lora_param_type: tp.Type[variablelib.Variable] = LoRAParam,
+    rngs: rnglib.Rngs,
   ):
     self.in_features = in_features
     self.out_features = out_features
@@ -98,14 +99,17 @@ class LoRA(Module):
     self.base_module = base_module
 
     self.lora_a = lora_param_type(
-        a_initializer(rngs.params(), (in_features, lora_rank), param_dtype)
+      a_initializer(rngs.params(), (in_features, lora_rank), param_dtype)
     )
     self.lora_b = lora_param_type(
-        b_initializer(rngs.params(), (lora_rank, out_features), param_dtype)
+      b_initializer(rngs.params(), (lora_rank, out_features), param_dtype)
     )
 
   def __call__(self, x: jax.Array):
-    out = x @ self.lora_a @ self.lora_b
+    x, lora_a, lora_b = promote_dtype(
+      (x, self.lora_a[...], self.lora_b[...]), dtype=self.dtype
+    )
+    out = x @ lora_a @ lora_b
     if self.base_module is not None:
       if not callable(self.base_module):
         raise ValueError('`self.base_module` must be callable.')

@@ -47,7 +47,7 @@ MA = tp.TypeVar('MA', bound=Module)
 N = tp.TypeVar('N', bound=Module)
 StrInt = tp.TypeVar('StrInt', str, int)
 AxisName = tp.Hashable
-Leaves = tp.List[Leaf]
+Leaves = list[Leaf]
 Index = int
 
 
@@ -132,16 +132,6 @@ def eval_shape(
   *args: tp.Any,
   **kwargs: tp.Any,
 ) -> A:
-  args, kwargs = extract.to_tree((args, kwargs))
-
-  @functools.wraps(f)
-  def _eval_shape_fn(*args, **kwargs):
-    args, kwargs = extract.from_tree((args, kwargs))
-    out = f(*args, **kwargs)
-    return extract.to_tree(out)
-
-  out = jax.eval_shape(_eval_shape_fn, *args, **kwargs)
-  return extract.from_tree(out)
   """A "lifted" version of `jax.eval_shape <https://jax.readthedocs.io/en/latest/_autosummary/jax.eval_shape.html#jax.eval_shape>`_
     that can handle `flax.nnx.Module <https://flax.readthedocs.io/en/latest/api_reference/flax.nnx/module.html#flax.nnx.Module>`_
     / graph nodes as arguments.
@@ -150,6 +140,16 @@ def eval_shape(
     performing any floating point operations (FLOPs) which can be expensive. This can be
     useful for performing shape inference, for example.
   """
+  args, kwargs = extract.to_tree((args, kwargs))
+
+  @functools.wraps(f)
+  def _eval_shape_fn(*args, **kwargs):
+    args, kwargs = extract.from_tree((args, kwargs))
+    out = f(*args, **kwargs)
+    return graph.freeze(extract.to_tree(out), allow_duplicates=True)
+
+  out = jax.eval_shape(_eval_shape_fn, *args, **kwargs)
+  return extract.from_tree(out)
 
 @dataclasses.dataclass(eq=False)
 class CheckifyFn:

@@ -66,7 +66,7 @@ class NNXMeta(struct.PyTreeNode, meta.AxisMetadata[A]):
   def get_partition_spec(self) -> jax.sharding.PartitionSpec:
     """Returns the ``Partitionspec`` for this partitioned value."""
     nnx_var = self.to_nnx_variable().to_state()
-    return spmd.get_partition_spec(nnx_var).value
+    return spmd.get_partition_spec(nnx_var).raw_value
 
   def to_nnx_variable(self) -> variablelib.Variable:
     return self.var_type(self.value, **self.metadata)
@@ -154,7 +154,7 @@ def nnx_attrs_to_linen_vars(nnx_attrs: dict) -> dict:
     elif isinstance(v, variablelib.VariableState):
       col_name = variablelib.variable_name_from_type(v.type)
       v = to_linen_var(v)
-    elif isinstance(v, graph.NodeDef) or isinstance(v, graph.NodeRef):
+    elif isinstance(v, graph.GraphDef):
       col_name = 'nnx'  # an nnx.GraphDef for some ToLinen submodule
     else:
       raise ValueError(f'Cannot infer collection name from value: {v}')

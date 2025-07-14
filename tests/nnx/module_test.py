@@ -367,13 +367,17 @@ class TestModule(absltest.TestCase):
         self.b = self.a
 
     m1 = Foo()
-    with nnx.update_context('test') as ctx:
-      graphdef, state = ctx.split(m1)
-      m2 = ctx.merge(graphdef, state)
+    with nnx.update_context('test'):
+      with nnx.split_context('test') as ctx:
+        graphdef, state = ctx.split(m1)
+      with nnx.merge_context('test', inner=True) as ctx:
+        m2 = ctx.merge(graphdef, state)
       m2.a.add_field()
-      new_graphdef, state = ctx.split(m2)
+      with nnx.split_context('test') as ctx:
+        new_graphdef, state = ctx.split(m2)
 
-      m3 = ctx.merge(new_graphdef, state)
+      with nnx.merge_context('test', inner=False) as ctx:
+        m3 = ctx.merge(new_graphdef, state)
 
     assert m3 is m1
     assert m1.a.x == 1
@@ -394,13 +398,17 @@ class TestModule(absltest.TestCase):
         self.b = Bar()
 
     m1 = Foo()
-    with nnx.update_context('test') as ctx:
-      graphdef, state = ctx.split(m1)
-      m2 = ctx.merge(graphdef, state)
+    with nnx.update_context('test'):
+      with nnx.split_context('test') as ctx:
+        graphdef, state = ctx.split(m1)
+      with nnx.merge_context('test', inner=True) as ctx:
+        m2 = ctx.merge(graphdef, state)
       m2.add_module()
-      new_graphdef, state = ctx.split(m2)
+      with nnx.split_context('test') as ctx:
+        new_graphdef, state = ctx.split(m2)
 
-      m3 = ctx.merge(new_graphdef, state)
+      with nnx.merge_context('test', inner=False) as ctx:
+        m3 = ctx.merge(new_graphdef, state)
 
     assert m3 is m1
     assert m1.a.x == 1
@@ -417,12 +425,16 @@ class TestModule(absltest.TestCase):
         self.b = self.a
 
     m1 = Foo()
-    with nnx.update_context('test') as ctx:
-      graphdef, state = ctx.split(m1)
-      m2 = ctx.merge(graphdef, state)
+    with nnx.update_context('test'):
+      with nnx.split_context('test') as ctx:
+        graphdef, state = ctx.split(m1)
+      with nnx.merge_context('test', inner=True) as ctx:
+        m2 = ctx.merge(graphdef, state)
       m2.a.x = 2
-      new_graphdef, state = ctx.split(m2)
-      m3 = ctx.merge(new_graphdef, state)
+      with nnx.split_context('test') as ctx:
+        new_graphdef, state = ctx.split(m2)
+      with nnx.merge_context('test', inner=False) as ctx:
+        m3 = ctx.merge(new_graphdef, state)
 
     assert m3 is m1
     assert m1.a.x == 2
@@ -442,12 +454,16 @@ class TestModule(absltest.TestCase):
         self.c = self.a
 
     m1 = Foo()
-    with nnx.update_context('test') as ctx:
-      graphdef, state = ctx.split(m1)
-      m2 = ctx.merge(graphdef, state)
+    with nnx.update_context('test'):
+      with nnx.split_context('test') as ctx:
+        graphdef, state = ctx.split(m1)
+      with nnx.merge_context('test', inner=True) as ctx:
+        m2 = ctx.merge(graphdef, state)
       m2.add_submodule()
-      new_graphdef, state = ctx.split(m2)
-      m3 = ctx.merge(new_graphdef, state)
+      with nnx.split_context('test') as ctx:
+        new_graphdef, state = ctx.split(m2)
+      with nnx.merge_context('test', inner=False) as ctx:
+        m3 = ctx.merge(new_graphdef, state)
 
     assert m3 is m1
     assert hasattr(m1, 'c')
@@ -461,7 +477,7 @@ class TestModule(absltest.TestCase):
   def test_create_abstract_stateful(self):
     linear = nnx.eval_shape(lambda: nnx.Dropout(0.5, rngs=nnx.Rngs(0)))
 
-    assert linear.rngs.default.key.value == jax.ShapeDtypeStruct(
+    assert linear.rngs.key.value == jax.ShapeDtypeStruct(
       (), jax.random.key(0).dtype
     )
 
@@ -623,42 +639,6 @@ class TestModule(absltest.TestCase):
     self.assertIn(str(expected_total_rng_states), foo_repr[0])
 
 
-class TestModulePytree:
-  def test_tree_map(self):
-    class Foo(nnx.Module, experimental_pytree=True):
-      def __init__(self):
-        self.node = nnx.Param(1)
-        self.graphdef = 1
-
-    m = Foo()
-
-    m = jax.tree.map(lambda x: x + 1, m)
-
-    assert m.node.value == 2
-    assert m.graphdef == 1
-
-  def test_static(self):
-    class C(nnx.Module, experimental_pytree=True):
-      def __init__(self, x):
-        self.x = x
-
-    n = 0
-
-    @jax.jit
-    def f(x):
-      nonlocal n
-      n += 1
-
-    f(C(1))
-    assert n == 1
-    f(C(1))
-    assert n == 1
-    f(C(2))
-    assert n == 2
-    f(C(2))
-    assert n == 2
-
-
 class TestModuleDataclass:
   def test_basic(self):
 
@@ -750,7 +730,7 @@ class TestModuleDef:
 
     graphdef, state = nnx.split(foo)
 
-    assert isinstance(graphdef, nnx.graph.NodeDef | nnx.graph.NodeRef)
+    assert isinstance(graphdef.nodes[0], nnx.graph.NodeDef | nnx.graph.NodeRef)
     assert isinstance(state, nnx.State)
     assert issubclass(state['w'].type, nnx.Param)
     assert issubclass(state['c'].type, nnx.Variable)

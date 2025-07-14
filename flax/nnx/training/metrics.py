@@ -112,7 +112,7 @@ class Average(Metric):
       raise TypeError(f"Expected keyword argument '{self.argname}'")
     values: tp.Union[int, float, jax.Array] = kwargs[self.argname]
     self.total.value += (
-        values if isinstance(values, (int, float)) else values.sum()
+      values if isinstance(values, (int, float)) else values.sum()
     )
     self.count.value += 1 if isinstance(values, (int, float)) else values.size
 

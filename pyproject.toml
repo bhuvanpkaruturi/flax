@@ -14,7 +14,7 @@ dependencies = [
     "numpy>=1.23.2; python_version>='3.11'",
     "numpy>=1.26.0; python_version>='3.12'",
     # keep in sync with jax-version in .github/workflows/build.yml
-    "jax>=0.5.1",
+    "jax>=0.6.0",
     "msgpack",
     "optax",
     "orbax-checkpoint",
@@ -64,9 +64,10 @@ testing = [
     "torch",
     "treescope>=0.1.1; python_version>='3.10'",
     "cloudpickle>=3.0.0",
+    "ale-py>=0.10.2",
 ]
 docs = [
-    "sphinx>=3.3.1",
+    "sphinx>=4.3.0",
     "sphinx-book-theme",
     "Pygments>=2.6.1",
     "ipykernel",
@@ -76,7 +77,7 @@ docs = [
     "ipython_genutils",
     "sphinx-design",
     "jupytext==1.13.8",
-    "dm-haiku",
+    "dm-haiku>=0.0.14",
     # Need to pin docutils to 0.16 to make bulleted lists appear correctly on
     # ReadTheDocs: https://stackoverflow.com/a/68008428
     "docutils==0.16",
@@ -91,7 +92,9 @@ docs = [
     "ipywidgets>=8.1.5",
 ]
 dev = [
+    "nanobind>=2.5.0",
     "pre-commit>=3.8.0",
+    "scikit-build-core[pyproject]>=0.11.0",
 ]
 
 [project.urls]
@@ -185,6 +188,10 @@ filterwarnings = [
     "ignore:.*numpy.core is deprecated.*:DeprecationWarning",
     # DeprecationWarning: shape requires ndarray or scalar arguments
     "ignore:.*shape requires ndarray or scalar arguments.*:DeprecationWarning",
+    # UserWarning: Sharding info not provided when restoring
+    "ignore:.*Sharding info not provided when restoring.*:UserWarning",
+    # UserWarning: pkg_resources is deprecated as an API.
+    "ignore:.*pkg_resources is deprecated as an API.*:UserWarning",
 ]
 
 [tool.coverage.report]
@@ -229,9 +236,3 @@ quote-style = "single"
 [tool.uv]
 # Ignore uv.lock and always upgrade the package to the latest
 upgrade-package = ["jax", "jaxlib", "orbax-checkpoint"]
-
-[dependency-groups]
-dev = [
-    "nanobind>=2.4.0",
-    "scikit-build-core[pyproject]>=0.10.7",
-]
