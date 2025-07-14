@@ -3,9 +3,11 @@ clu==0.0.6
 flax==0.10.4
 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-jax[tpu]==0.5.3
+-i https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/
+jax[tpu]==0.7.0.dev20250714
+jaxlib==0.7.0.dev20250714
 ml-collections==0.1.0
 numpy==1.26.4
 optax==0.2.4
-tensorflow==2.11.1
-tensorflow-datasets==4.4.0
+tensorflow==2.19
+tensorflow-datasets==4.9.2
